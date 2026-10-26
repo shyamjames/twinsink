@@ -1,5 +1,6 @@
 mod config;
 mod ipc;
+mod pipeline;
 mod pipewire_thread;
 
 use anyhow::Result;

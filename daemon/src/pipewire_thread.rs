@@ -6,10 +6,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tracing::{info, warn};
 use twinsink_core::{AppConfig, AudioDevice, ChannelMode, DaemonStatus, DeviceState};
+
+use crate::pipeline::AudioPipeline;
 
 #[derive(Debug)]
 pub enum PwCommand {
@@ -64,30 +67,13 @@ struct SinkRecord {
     _listener: pw::node::NodeListener,
 }
 
-#[derive(Debug, Clone)]
-struct PortRecord {
-    id: u32,
-    node_id: u32,
-    direction: String,
-    name: String,
-    channel: Option<String>,
-}
-
-struct LinkedDevice {
-    device_name: String,
-    _link_fl: pw::link::Link,
-    _link_fr: pw::link::Link,
-}
-
 struct RouterState {
     core: pw::core::CoreRc,
     metadata: Option<pw::metadata::Metadata>,
     _metadata_listener: Option<pw::metadata::MetadataListener>,
     virtual_node: Option<pw::node::Node>,
-    virtual_node_id: Option<u32>,
     virtual_sink_active: bool,
     sinks: HashMap<u32, SinkRecord>,
-    ports: HashMap<u32, PortRecord>,
     selected_pair: (Option<String>, Option<String>),
     volume_a: f32,
     volume_b: f32,
@@ -96,7 +82,15 @@ struct RouterState {
     delay_ms_a: u32,
     delay_ms_b: u32,
     mode: ChannelMode,
-    links: Vec<LinkedDevice>,
+    connected_a: bool,
+    connected_b: bool,
+    pipeline: Arc<Mutex<AudioPipeline>>,
+    cap_stream: Option<pw::stream::StreamRc>,
+    _cap_listener: Option<pw::stream::StreamListener<()>>,
+    out_stream_a: Option<pw::stream::StreamRc>,
+    _out_listener_a: Option<pw::stream::StreamListener<()>>,
+    out_stream_b: Option<pw::stream::StreamRc>,
+    _out_listener_b: Option<pw::stream::StreamListener<()>>,
     original_default_sink: Option<String>,
     configured_default_sink: Option<String>,
     event_tx: tokio_mpsc::UnboundedSender<PwEvent>,
@@ -365,47 +359,13 @@ fn set_default_sink_metadata(metadata: &pw::metadata::Metadata, sink_name: &str)
     );
 }
 
-fn is_fl(port: &PortRecord) -> bool {
-    if let Some(ref ch) = port.channel {
-        if ch == "FL" || ch.eq_ignore_ascii_case("front-left") || ch.eq_ignore_ascii_case("mono") {
-            return true;
-        }
-    }
-    let lower = port.name.to_lowercase();
-    lower.contains("fl") || lower.contains("left") || lower.ends_with("_0") || lower.ends_with(":1")
-}
-
-fn is_fr(port: &PortRecord) -> bool {
-    if let Some(ref ch) = port.channel {
-        if ch == "FR" || ch.eq_ignore_ascii_case("front-right") {
-            return true;
-        }
-    }
-    let lower = port.name.to_lowercase();
-    lower.contains("fr")
-        || lower.contains("right")
-        || lower.ends_with("_1")
-        || lower.ends_with(":2")
-}
-
 fn current_status(state: &RouterState) -> DaemonStatus {
-    let connected_a = state
-        .selected_pair
-        .0
-        .as_ref()
-        .is_some_and(|name| state.links.iter().any(|l| &l.device_name == name));
-    let connected_b = state
-        .selected_pair
-        .1
-        .as_ref()
-        .is_some_and(|name| state.links.iter().any(|l| &l.device_name == name));
-
     DaemonStatus {
         virtual_sink: "twinsink".to_string(),
         device_a: state.selected_pair.0.clone(),
         device_b: state.selected_pair.1.clone(),
-        connected_a,
-        connected_b,
+        connected_a: state.connected_a,
+        connected_b: state.connected_b,
         volume_a: state.volume_a,
         volume_b: state.volume_b,
         mute_a: state.mute_a,
@@ -419,123 +379,6 @@ fn current_status(state: &RouterState) -> DaemonStatus {
 fn emit_status(state: &RouterState) {
     let status = current_status(state);
     let _ = state.event_tx.send(PwEvent::Status(status));
-}
-
-fn try_link_device(state: &mut RouterState, target_name: &str) -> Result<bool> {
-    if state.links.iter().any(|l| l.device_name == target_name) {
-        return Ok(true);
-    }
-
-    let virtual_id = match state.virtual_node_id {
-        Some(id) => id,
-        None => return Ok(false),
-    };
-
-    let target_node_id = match state.sinks.values().find(|s| s.name == target_name) {
-        Some(s) => s.id,
-        None => return Ok(false),
-    };
-
-    let fl_out_id = match state
-        .ports
-        .values()
-        .find(|p| p.node_id == virtual_id && p.direction == "out" && is_fl(p))
-    {
-        Some(p) => p.id,
-        None => return Ok(false),
-    };
-
-    let fr_out_id = match state
-        .ports
-        .values()
-        .find(|p| p.node_id == virtual_id && p.direction == "out" && is_fr(p))
-    {
-        Some(p) => p.id,
-        None => return Ok(false),
-    };
-
-    let fl_in_id = match state
-        .ports
-        .values()
-        .find(|p| p.node_id == target_node_id && p.direction == "in" && is_fl(p))
-    {
-        Some(p) => p.id,
-        None => return Ok(false),
-    };
-
-    let fr_in_id = match state
-        .ports
-        .values()
-        .find(|p| p.node_id == target_node_id && p.direction == "in" && is_fr(p))
-    {
-        Some(p) => p.id,
-        None => return Ok(false),
-    };
-
-    let link_fl = state.core.create_object::<pw::link::Link>(
-        "link-factory",
-        &pw::properties::properties! {
-            "link.output.node" => virtual_id.to_string(),
-            "link.output.port" => fl_out_id.to_string(),
-            "link.input.node" => target_node_id.to_string(),
-            "link.input.port" => fl_in_id.to_string(),
-            "object.linger" => "false",
-        },
-    )?;
-
-    let link_fr = state.core.create_object::<pw::link::Link>(
-        "link-factory",
-        &pw::properties::properties! {
-            "link.output.node" => virtual_id.to_string(),
-            "link.output.port" => fr_out_id.to_string(),
-            "link.input.node" => target_node_id.to_string(),
-            "link.input.port" => fr_in_id.to_string(),
-            "object.linger" => "false",
-        },
-    )?;
-
-    info!(
-        sink = target_name,
-        node_id = target_node_id,
-        "Successfully linked twinsink monitor ports to sink"
-    );
-
-    state.links.push(LinkedDevice {
-        device_name: target_name.to_string(),
-        _link_fl: link_fl,
-        _link_fr: link_fr,
-    });
-
-    let (vol, mute) = if state.selected_pair.0.as_deref() == Some(target_name) {
-        (state.volume_a, state.mute_a)
-    } else {
-        (state.volume_b, state.mute_b)
-    };
-    apply_device_volume(target_name, Some(target_node_id), vol);
-    apply_device_mute(target_name, Some(target_node_id), mute);
-
-    Ok(true)
-}
-
-fn try_relink_all(state: &mut RouterState) {
-    let mut changed = false;
-    if let Some(ref dev_a) = state.selected_pair.0.clone() {
-        if let Ok(linked) = try_link_device(state, dev_a) {
-            if linked {
-                changed = true;
-            }
-        }
-    }
-    if let Some(ref dev_b) = state.selected_pair.1.clone() {
-        if let Ok(linked) = try_link_device(state, dev_b) {
-            if linked {
-                changed = true;
-            }
-        }
-    }
-    if changed {
-        emit_status(state);
-    }
 }
 
 fn ensure_virtual_sink(state: &mut RouterState) -> Result<()> {
@@ -565,6 +408,230 @@ fn ensure_virtual_sink(state: &mut RouterState) -> Result<()> {
     Ok(())
 }
 
+fn ensure_capture_stream(state: &mut RouterState) -> Result<()> {
+    if state.cap_stream.is_some() {
+        return Ok(());
+    }
+
+    let cap_props = pw::properties::properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+        *pw::keys::MEDIA_ROLE => "Music",
+        *pw::keys::NODE_NAME => "twinsink-capture",
+        *pw::keys::NODE_DESCRIPTION => "TwinSink Monitor Capture",
+        *pw::keys::STREAM_CAPTURE_SINK => "true",
+        "target.object" => "twinsink",
+        "audio.channels" => "2",
+        "audio.rate" => "48000",
+    };
+
+    let stream = pw::stream::StreamRc::new(state.core.clone(), "twinsink-capture", cap_props)?;
+    let pipeline = state.pipeline.clone();
+
+    let listener = stream
+        .add_local_listener::<()>()
+        .process(move |stream, _| {
+            if let Some(mut buf) = stream.dequeue_buffer() {
+                let datas = buf.datas_mut();
+                if datas.is_empty() {
+                    return;
+                }
+                let chunk = &mut datas[0];
+                let chunk_size = chunk.chunk().size() as usize;
+                if let Some(bytes) = chunk.data() {
+                    let n_samples = chunk_size / std::mem::size_of::<f32>();
+                    if n_samples > 0 {
+                        if let Ok(mut pipe) = pipeline.lock() {
+                            pipe.push_raw_bytes(bytes, n_samples);
+                        }
+                    }
+                }
+            }
+        })
+        .register()?;
+
+    let param_bytes = crate::pipeline::make_format_params();
+    let mut params = [pw::spa::pod::Pod::from_bytes(&param_bytes).unwrap()];
+
+    stream.connect(
+        pw::spa::utils::Direction::Input,
+        None,
+        pw::stream::StreamFlags::AUTOCONNECT
+            | pw::stream::StreamFlags::MAP_BUFFERS
+            | pw::stream::StreamFlags::RT_PROCESS,
+        &mut params,
+    )?;
+
+    state.cap_stream = Some(stream);
+    state._cap_listener = Some(listener);
+    info!("Initialized twinsink monitor capture stream");
+    Ok(())
+}
+
+fn create_out_stream_a(state: &mut RouterState, target_device: &str) -> Result<()> {
+    let out_props = pw::properties::properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Playback",
+        *pw::keys::MEDIA_ROLE => "Music",
+        *pw::keys::NODE_NAME => "twinsink-out-a",
+        *pw::keys::NODE_DESCRIPTION => "TwinSink Output A",
+        "target.object" => target_device,
+        "audio.channels" => "2",
+        "audio.rate" => "48000",
+    };
+
+    let stream = pw::stream::StreamRc::new(state.core.clone(), "twinsink-out-a", out_props)?;
+    let pipeline = state.pipeline.clone();
+
+    let listener = stream
+        .add_local_listener::<()>()
+        .process(move |stream, _| {
+            if let Some(mut buf) = stream.dequeue_buffer() {
+                let datas = buf.datas_mut();
+                if datas.is_empty() {
+                    return;
+                }
+                let data = &mut datas[0];
+                let stride = 8;
+                if let Some(slice) = data.data() {
+                    let n_frames = slice.len() / stride;
+                    if let Ok(mut pipe) = pipeline.lock() {
+                        pipe.read_frames_a(slice, n_frames);
+                    }
+                    let chunk = data.chunk_mut();
+                    *chunk.offset_mut() = 0;
+                    *chunk.stride_mut() = stride as _;
+                    *chunk.size_mut() = (stride * n_frames) as _;
+                }
+            }
+        })
+        .register()?;
+
+    let param_bytes = crate::pipeline::make_format_params();
+    let mut params = [pw::spa::pod::Pod::from_bytes(&param_bytes).unwrap()];
+
+    stream.connect(
+        pw::spa::utils::Direction::Output,
+        None,
+        pw::stream::StreamFlags::AUTOCONNECT
+            | pw::stream::StreamFlags::MAP_BUFFERS
+            | pw::stream::StreamFlags::RT_PROCESS,
+        &mut params,
+    )?;
+
+    state.out_stream_a = Some(stream);
+    state._out_listener_a = Some(listener);
+    info!(target = target_device, "Started twinsink playback stream A");
+    Ok(())
+}
+
+fn create_out_stream_b(state: &mut RouterState, target_device: &str) -> Result<()> {
+    let out_props = pw::properties::properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Playback",
+        *pw::keys::MEDIA_ROLE => "Music",
+        *pw::keys::NODE_NAME => "twinsink-out-b",
+        *pw::keys::NODE_DESCRIPTION => "TwinSink Output B",
+        "target.object" => target_device,
+        "audio.channels" => "2",
+        "audio.rate" => "48000",
+    };
+
+    let stream = pw::stream::StreamRc::new(state.core.clone(), "twinsink-out-b", out_props)?;
+    let pipeline = state.pipeline.clone();
+
+    let listener = stream
+        .add_local_listener::<()>()
+        .process(move |stream, _| {
+            if let Some(mut buf) = stream.dequeue_buffer() {
+                let datas = buf.datas_mut();
+                if datas.is_empty() {
+                    return;
+                }
+                let data = &mut datas[0];
+                let stride = 8;
+                if let Some(slice) = data.data() {
+                    let n_frames = slice.len() / stride;
+                    if let Ok(mut pipe) = pipeline.lock() {
+                        pipe.read_frames_b(slice, n_frames);
+                    }
+                    let chunk = data.chunk_mut();
+                    *chunk.offset_mut() = 0;
+                    *chunk.stride_mut() = stride as _;
+                    *chunk.size_mut() = (stride * n_frames) as _;
+                }
+            }
+        })
+        .register()?;
+
+    let param_bytes = crate::pipeline::make_format_params();
+    let mut params = [pw::spa::pod::Pod::from_bytes(&param_bytes).unwrap()];
+
+    stream.connect(
+        pw::spa::utils::Direction::Output,
+        None,
+        pw::stream::StreamFlags::AUTOCONNECT
+            | pw::stream::StreamFlags::MAP_BUFFERS
+            | pw::stream::StreamFlags::RT_PROCESS,
+        &mut params,
+    )?;
+
+    state.out_stream_b = Some(stream);
+    state._out_listener_b = Some(listener);
+    info!(target = target_device, "Started twinsink playback stream B");
+    Ok(())
+}
+
+fn update_output_streams(state: &mut RouterState) {
+    // Stream A
+    if let Some(ref target_a) = state.selected_pair.0.clone() {
+        if state.sinks.values().any(|s| &s.name == target_a) {
+            if state.out_stream_a.is_none() {
+                if let Err(e) = create_out_stream_a(state, target_a) {
+                    warn!(target = %target_a, "Failed to create output stream A: {:?}", e);
+                    state.connected_a = false;
+                } else {
+                    state.connected_a = true;
+                }
+            } else {
+                state.connected_a = true;
+            }
+        } else {
+            state._out_listener_a = None;
+            state.out_stream_a = None;
+            state.connected_a = false;
+        }
+    } else {
+        state._out_listener_a = None;
+        state.out_stream_a = None;
+        state.connected_a = false;
+    }
+
+    // Stream B
+    if let Some(ref target_b) = state.selected_pair.1.clone() {
+        if state.sinks.values().any(|s| &s.name == target_b) {
+            if state.out_stream_b.is_none() {
+                if let Err(e) = create_out_stream_b(state, target_b) {
+                    warn!(target = %target_b, "Failed to create output stream B: {:?}", e);
+                    state.connected_b = false;
+                } else {
+                    state.connected_b = true;
+                }
+            } else {
+                state.connected_b = true;
+            }
+        } else {
+            state._out_listener_b = None;
+            state.out_stream_b = None;
+            state.connected_b = false;
+        }
+    } else {
+        state._out_listener_b = None;
+        state.out_stream_b = None;
+        state.connected_b = false;
+    }
+}
+
 fn shutdown_router(state: &mut RouterState) {
     info!("Shutting down twinsink audio routing");
     if let Some(ref orig) = state.original_default_sink {
@@ -574,9 +641,16 @@ fn shutdown_router(state: &mut RouterState) {
         }
     }
     clear_saved_default();
-    state.links.clear();
+    state._out_listener_a = None;
+    state.out_stream_a = None;
+    state._out_listener_b = None;
+    state.out_stream_b = None;
+    state._cap_listener = None;
+    state.cap_stream = None;
     state.virtual_node = None;
     state.virtual_sink_active = false;
+    state.connected_a = false;
+    state.connected_b = false;
 }
 
 fn run_pipewire_loop(
@@ -622,15 +696,23 @@ fn run_pipewire_loop(
         }
     };
 
+    let pipeline = Arc::new(Mutex::new(AudioPipeline::new(
+        ChannelMode::Duplicate,
+        0,
+        0,
+        1.0,
+        1.0,
+        false,
+        false,
+    )));
+
     let state = Rc::new(RefCell::new(RouterState {
         core: core.clone(),
         metadata: None,
         _metadata_listener: None,
         virtual_node: None,
-        virtual_node_id: None,
         virtual_sink_active: false,
         sinks: HashMap::new(),
-        ports: HashMap::new(),
         selected_pair: (None, None),
         volume_a: 1.0,
         volume_b: 1.0,
@@ -639,7 +721,15 @@ fn run_pipewire_loop(
         delay_ms_a: 0,
         delay_ms_b: 0,
         mode: ChannelMode::Duplicate,
-        links: Vec::new(),
+        connected_a: false,
+        connected_b: false,
+        pipeline,
+        cap_stream: None,
+        _cap_listener: None,
+        out_stream_a: None,
+        _out_listener_a: None,
+        out_stream_b: None,
+        _out_listener_b: None,
         original_default_sink: None,
         configured_default_sink: None,
         event_tx: event_tx.clone(),
@@ -677,12 +767,26 @@ fn run_pipewire_loop(
             st.delay_ms_b = config.delay_ms_b;
             st.mode = config.mode;
 
-            if config.device_a.is_some() && config.device_b.is_some() {
+            if let Ok(mut pipe) = st.pipeline.lock() {
+                pipe.volume_a = config.volume_a;
+                pipe.volume_b = config.volume_b;
+                pipe.mute_a = config.mute_a;
+                pipe.mute_b = config.mute_b;
+                pipe.set_delay_a(config.delay_ms_a);
+                pipe.set_delay_b(config.delay_ms_b);
+                pipe.set_mode(config.mode);
+            }
+
+            if config.device_a.is_some() || config.device_b.is_some() {
                 if let Err(e) = ensure_virtual_sink(&mut st) {
                     let _ = resp.send(Err(e));
                     return;
                 }
-                try_relink_all(&mut st);
+                if let Err(e) = ensure_capture_stream(&mut st) {
+                    let _ = resp.send(Err(e));
+                    return;
+                }
+                update_output_streams(&mut st);
             }
             emit_status(&st);
             persist_state(&st);
@@ -702,14 +806,25 @@ fn run_pipewire_loop(
 
             let mut st = state_for_cmds.borrow_mut();
             st.selected_pair = (Some(device_a.clone()), Some(device_b.clone()));
-            st.links.clear();
+
+            // Reset previous output streams
+            st._out_listener_a = None;
+            st.out_stream_a = None;
+            st._out_listener_b = None;
+            st.out_stream_b = None;
+            st.connected_a = false;
+            st.connected_b = false;
 
             if let Err(e) = ensure_virtual_sink(&mut st) {
                 let _ = resp.send(Err(e));
                 return;
             }
+            if let Err(e) = ensure_capture_stream(&mut st) {
+                let _ = resp.send(Err(e));
+                return;
+            }
 
-            try_relink_all(&mut st);
+            update_output_streams(&mut st);
             emit_status(&st);
             persist_state(&st);
             let _ = resp.send(Ok(()));
@@ -728,12 +843,18 @@ fn run_pipewire_loop(
             let mut found = false;
             if st.selected_pair.0.as_deref() == Some(&device) {
                 st.volume_a = vol;
+                if let Ok(mut pipe) = st.pipeline.lock() {
+                    pipe.set_volume_a(vol);
+                }
                 let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
                 apply_device_volume(&device, node_id, vol);
                 found = true;
             }
             if st.selected_pair.1.as_deref() == Some(&device) {
                 st.volume_b = vol;
+                if let Ok(mut pipe) = st.pipeline.lock() {
+                    pipe.set_volume_b(vol);
+                }
                 let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
                 apply_device_volume(&device, node_id, vol);
                 found = true;
@@ -755,6 +876,9 @@ fn run_pipewire_loop(
             if st.selected_pair.0.as_deref() == Some(&device) {
                 let new_mute = mute.unwrap_or(!st.mute_a);
                 st.mute_a = new_mute;
+                if let Ok(mut pipe) = st.pipeline.lock() {
+                    pipe.set_mute_a(new_mute);
+                }
                 let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
                 apply_device_mute(&device, node_id, new_mute);
                 found = true;
@@ -762,6 +886,9 @@ fn run_pipewire_loop(
             if st.selected_pair.1.as_deref() == Some(&device) {
                 let new_mute = mute.unwrap_or(!st.mute_b);
                 st.mute_b = new_mute;
+                if let Ok(mut pipe) = st.pipeline.lock() {
+                    pipe.set_mute_b(new_mute);
+                }
                 let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
                 apply_device_mute(&device, node_id, new_mute);
                 found = true;
@@ -786,13 +913,20 @@ fn run_pipewire_loop(
             let mut found = false;
             if st.selected_pair.0.as_deref() == Some(&device) {
                 st.delay_ms_a = delay_ms;
+                if let Ok(mut pipe) = st.pipeline.lock() {
+                    pipe.set_delay_a(delay_ms);
+                }
                 found = true;
             }
             if st.selected_pair.1.as_deref() == Some(&device) {
                 st.delay_ms_b = delay_ms;
+                if let Ok(mut pipe) = st.pipeline.lock() {
+                    pipe.set_delay_b(delay_ms);
+                }
                 found = true;
             }
             if found {
+                info!(device = %device, delay_ms = delay_ms, "Updated output delay");
                 emit_status(&st);
                 persist_state(&st);
                 let _ = resp.send(Ok(()));
@@ -806,6 +940,10 @@ fn run_pipewire_loop(
         PwCommand::SetMode { mode, resp } => {
             let mut st = state_for_cmds.borrow_mut();
             st.mode = mode;
+            if let Ok(mut pipe) = st.pipeline.lock() {
+                pipe.set_mode(mode);
+            }
+            info!(mode = %mode, "Updated router channel mode");
             emit_status(&st);
             persist_state(&st);
             let _ = resp.send(Ok(()));
@@ -848,11 +986,7 @@ fn run_pipewire_loop(
                     None => return,
                 };
 
-                if name == "twinsink" {
-                    info!(id = obj.id, "Discovered twinsink node in registry");
-                    let mut st = state_for_reg.borrow_mut();
-                    st.virtual_node_id = Some(obj.id);
-                    try_relink_all(&mut st);
+                if name == "twinsink" || name.starts_with("twinsink-") {
                     return;
                 }
 
@@ -944,30 +1078,9 @@ fn run_pipewire_loop(
                     },
                 );
 
-                // Auto re-link if device is in selected pair
-                try_relink_all(&mut st);
-            } else if obj.type_ == ObjectType::Port {
-                let node_id: u32 = match props.get(*pw::keys::NODE_ID).and_then(|s| s.parse().ok())
-                {
-                    Some(id) => id,
-                    None => return,
-                };
-                let direction = props.get(*pw::keys::PORT_DIRECTION).unwrap_or("").to_string();
-                let name = props.get(*pw::keys::PORT_NAME).unwrap_or("").to_string();
-                let channel = props.get(*pw::keys::AUDIO_CHANNEL).map(|s| s.to_string());
-
-                let mut st = state_for_reg.borrow_mut();
-                st.ports.insert(
-                    obj.id,
-                    PortRecord {
-                        id: obj.id,
-                        node_id,
-                        direction,
-                        name,
-                        channel,
-                    },
-                );
-                try_relink_all(&mut st);
+                // Auto re-connect output streams if matching selected pair
+                update_output_streams(&mut st);
+                emit_status(&st);
             } else if obj.type_ == ObjectType::Metadata {
                 let metadata_name = props.get("metadata.name");
                 if metadata_name == Some("default") {
@@ -1001,9 +1114,9 @@ fn run_pipewire_loop(
                                                         })
                                                         .or_else(|| {
                                                             st.sinks
-                                                                .values()
-                                                                .map(|s| s.name.clone())
-                                                                .next()
+                                                                 .values()
+                                                                 .map(|s| s.name.clone())
+                                                                 .next()
                                                         });
                                                     if let Some(fb) = fallback {
                                                         warn!(
@@ -1077,20 +1190,30 @@ fn run_pipewire_loop(
             let state_for_remove = state.clone();
             move |id| {
                 let mut st = state_for_remove.borrow_mut();
-                st.ports.remove(&id);
                 if let Some(removed) = st.sinks.remove(&id) {
                     info!(id = id, name = %removed.name, "Audio sink removed");
                     let _ = st.event_tx.send(PwEvent::Removed {
                         id,
                         name: removed.name.clone(),
                     });
-                    // Unlink device if it was linked
-                    let was_linked = st.links.iter().any(|l| l.device_name == removed.name);
-                    st.links.retain(|l| l.device_name != removed.name);
-                    if was_linked {
+
+                    let mut changed = false;
+                    if st.selected_pair.0.as_deref() == Some(&removed.name) {
+                        st._out_listener_a = None;
+                        st.out_stream_a = None;
+                        st.connected_a = false;
+                        changed = true;
+                    }
+                    if st.selected_pair.1.as_deref() == Some(&removed.name) {
+                        st._out_listener_b = None;
+                        st.out_stream_b = None;
+                        st.connected_b = false;
+                        changed = true;
+                    }
+                    if changed {
                         warn!(
                             sink = %removed.name,
-                            "Selected sink disconnected; removed active link"
+                            "Selected sink disconnected; output stream closed"
                         );
                         emit_status(&st);
                     }
@@ -1107,9 +1230,13 @@ fn run_pipewire_loop(
     drop(_cmd_attached);
     {
         let mut st = state.borrow_mut();
-        st.links.clear();
+        st._out_listener_a = None;
+        st.out_stream_a = None;
+        st._out_listener_b = None;
+        st.out_stream_b = None;
+        st._cap_listener = None;
+        st.cap_stream = None;
         st.sinks.clear();
-        st.ports.clear();
         st.virtual_node = None;
         st.metadata = None;
         st._metadata_listener = None;

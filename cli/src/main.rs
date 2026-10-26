@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use twinsink_core::{socket_path, AudioDevice, DaemonEvent, DaemonStatus, IpcRequest, IpcResponse};
+use twinsink_core::{
+    socket_path, AudioDevice, ChannelMode, DaemonEvent, DaemonStatus, IpcRequest, IpcResponse,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -52,6 +54,20 @@ enum Commands {
         device: String,
         #[arg(long, help = "Explicit mute state: true to mute, false to unmute")]
         state: Option<bool>,
+    },
+
+    #[command(about = "Set delay in milliseconds for a selected device")]
+    Delay {
+        #[arg(help = "Target sink name (node.name)")]
+        device: String,
+        #[arg(help = "Delay in milliseconds (e.g. 150)")]
+        delay_ms: u32,
+    },
+
+    #[command(about = "Set channel routing mode: duplicate, split, or mono")]
+    Mode {
+        #[arg(help = "Channel mode (duplicate, split, or mono)")]
+        mode: ChannelMode,
     },
 
     #[command(about = "Subscribe to live event stream from the daemon")]
@@ -264,6 +280,93 @@ async fn main() -> ExitCode {
                         println!(
                             "{}",
                             message.unwrap_or_else(|| format!("Mute updated for {}", device))
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Ok(IpcResponse::Error { message }) => {
+                    eprintln!("Error: {}", message);
+                    ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("Unexpected response: {:?}", other);
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("Error reading response: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::Delay { device, delay_ms } => {
+            let req = IpcRequest::Delay {
+                device: device.clone(),
+                delay_ms,
+            };
+            if let Err(e) = send_request(&mut writer, &req).await {
+                eprintln!("Error sending request: {}", e);
+                return ExitCode::FAILURE;
+            }
+
+            match read_response(&mut lines).await {
+                Ok(IpcResponse::Ok { message }) => {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "status": "ok",
+                                "device": device,
+                                "delay_ms": delay_ms,
+                                "message": message
+                            })
+                        );
+                    } else {
+                        println!(
+                            "{}",
+                            message.unwrap_or_else(|| format!(
+                                "Delay for {} set to {}ms",
+                                device, delay_ms
+                            ))
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Ok(IpcResponse::Error { message }) => {
+                    eprintln!("Error: {}", message);
+                    ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("Unexpected response: {:?}", other);
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("Error reading response: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::Mode { mode } => {
+            let req = IpcRequest::Mode { mode };
+            if let Err(e) = send_request(&mut writer, &req).await {
+                eprintln!("Error sending request: {}", e);
+                return ExitCode::FAILURE;
+            }
+
+            match read_response(&mut lines).await {
+                Ok(IpcResponse::Ok { message }) => {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "status": "ok",
+                                "mode": mode,
+                                "message": message
+                            })
+                        );
+                    } else {
+                        println!(
+                            "{}",
+                            message.unwrap_or_else(|| format!("Channel mode set to {}", mode))
                         );
                     }
                     ExitCode::SUCCESS
