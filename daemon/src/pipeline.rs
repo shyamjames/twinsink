@@ -4,7 +4,7 @@ use twinsink_core::ChannelMode;
 pub const SAMPLE_RATE: u32 = 48000;
 pub const CHANNELS: usize = 2;
 pub const RING_CAPACITY_FRAMES: usize = 240_000; // 5 seconds @ 48kHz
-pub const BASE_CUSHION_FRAMES: u64 = 2048; // ~42.6ms cushion to absorb graph jitter
+pub const BASE_CUSHION_FRAMES: u64 = 4096; // ~85ms cushion to absorb graph jitter
 
 pub struct AudioPipeline {
     ring_buffer: Vec<f32>,
@@ -96,7 +96,7 @@ impl AudioPipeline {
             self.sync_needed_a = false;
         } else {
             let diff = self.read_frame_a.abs_diff(ideal_read);
-            if diff > 4096 {
+            if diff > 12000 {
                 self.read_frame_a = ideal_read;
             }
         }
@@ -147,7 +147,7 @@ impl AudioPipeline {
             self.sync_needed_b = false;
         } else {
             let diff = self.read_frame_b.abs_diff(ideal_read);
-            if diff > 4096 {
+            if diff > 12000 {
                 self.read_frame_b = ideal_read;
             }
         }

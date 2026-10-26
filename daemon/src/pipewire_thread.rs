@@ -9,7 +9,7 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use twinsink_core::{AppConfig, AudioDevice, ChannelMode, DaemonStatus, DeviceState};
 
 use crate::pipeline::AudioPipeline;
@@ -521,7 +521,7 @@ fn create_out_stream_a(state: &mut RouterState, target_device: &str) -> Result<(
 
     state.out_stream_a = Some(stream);
     state._out_listener_a = Some(listener);
-    info!(target = target_device, "Started twinsink playback stream A");
+    debug!(target = target_device, "Started twinsink playback stream A");
     Ok(())
 }
 
@@ -578,7 +578,7 @@ fn create_out_stream_b(state: &mut RouterState, target_device: &str) -> Result<(
 
     state.out_stream_b = Some(stream);
     state._out_listener_b = Some(listener);
-    info!(target = target_device, "Started twinsink playback stream B");
+    debug!(target = target_device, "Started twinsink playback stream B");
     Ok(())
 }
 
@@ -1028,7 +1028,7 @@ fn run_pipewire_loop(
                         if let Some(entry) = st.sinks.get_mut(&id) {
                             if entry.state != node_state {
                                 entry.state = node_state;
-                                info!(
+                                debug!(
                                     id = id,
                                     name = %name_info,
                                     state = ?node_state,

@@ -9,8 +9,8 @@ use ipc::IpcServer;
 use pipewire_thread::{PipewireHandle, PwEvent};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{debug, info, warn};
+use tracing_subscriber::{fmt, EnvFilter};
 use twinsink_core::DaemonEvent;
 
 #[derive(Parser, Debug)]
@@ -31,10 +31,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_target(false)
+        .init();
 
     let args = Args::parse();
     info!("Starting twinsink daemon");
@@ -132,13 +134,13 @@ async fn main() -> Result<()> {
                         }
                     }
                     PwEvent::Changed(dev) => {
-                        info!("Event: Changed -> {} state={:?}", dev.name, dev.state);
+                        debug!("Event: Changed -> {} state={:?}", dev.name, dev.state);
                         if let Ok(devs) = handle.list_devices().await {
                             let _ = bcast_tx.send(DaemonEvent::Devices { devices: devs });
                         }
                     }
                     PwEvent::Status(status) => {
-                        info!(
+                        debug!(
                             "Status update: pair=({:?}, {:?}) connected=({}, {})",
                             status.device_a, status.device_b, status.connected_a, status.connected_b
                         );
