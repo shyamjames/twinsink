@@ -1,0 +1,14 @@
+[Unit]
+Description=TwinSink - Headless Multi-Output Audio Router for PipeWire
+Documentation=https://github.com/shyam/twinsink
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/twinsink-daemon
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target
