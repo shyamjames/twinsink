@@ -9,11 +9,15 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tracing::{info, warn};
-use twinsink_core::{AudioDevice, ChannelMode, DaemonStatus, DeviceState};
+use twinsink_core::{AppConfig, AudioDevice, ChannelMode, DaemonStatus, DeviceState};
 
 #[derive(Debug)]
 pub enum PwCommand {
     ListDevices(oneshot::Sender<Vec<AudioDevice>>),
+    ApplyConfig {
+        config: AppConfig,
+        resp: oneshot::Sender<Result<()>>,
+    },
     SelectPair {
         device_a: String,
         device_b: String,
@@ -135,6 +139,19 @@ impl PipewireHandle {
             .send(PwCommand::ListDevices(resp_tx))
             .map_err(|_| anyhow::anyhow!("Failed to send ListDevices command"))?;
         resp_rx.await.context("Failed to receive devices")
+    }
+
+    pub async fn apply_config(&self, config: AppConfig) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PwCommand::ApplyConfig {
+                config,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send ApplyConfig command"))?;
+        resp_rx
+            .await
+            .context("Failed to receive ApplyConfig reply")?
     }
 
     pub async fn select_pair(&self, device_a: String, device_b: String) -> Result<()> {
@@ -263,6 +280,73 @@ fn save_default(name: &str) {
 fn clear_saved_default() {
     let path = get_config_dir().join("saved_default_sink.txt");
     let _ = std::fs::remove_file(path);
+}
+
+pub fn apply_device_volume(device_name: &str, node_id: Option<u32>, volume: f32) {
+    let vol_clamped = volume.clamp(0.0, 1.0);
+    let mut success = false;
+    if let Some(id) = node_id {
+        if let Ok(mut child) = std::process::Command::new("wpctl")
+            .args([
+                "set-volume",
+                &id.to_string(),
+                &format!("{:.2}", vol_clamped),
+            ])
+            .spawn()
+        {
+            if child.wait().is_ok() {
+                success = true;
+            }
+        }
+    }
+    if !success {
+        let percent = (vol_clamped * 100.0).round() as u32;
+        let _ = std::process::Command::new("pactl")
+            .args(["set-sink-volume", device_name, &format!("{}%", percent)])
+            .status();
+    }
+}
+
+pub fn apply_device_mute(device_name: &str, node_id: Option<u32>, mute: bool) {
+    let mut success = false;
+    if let Some(id) = node_id {
+        let mute_arg = if mute { "1" } else { "0" };
+        if let Ok(mut child) = std::process::Command::new("wpctl")
+            .args(["set-mute", &id.to_string(), mute_arg])
+            .spawn()
+        {
+            if child.wait().is_ok() {
+                success = true;
+            }
+        }
+    }
+    if !success {
+        let mute_arg = if mute { "1" } else { "0" };
+        let _ = std::process::Command::new("pactl")
+            .args(["set-sink-mute", device_name, mute_arg])
+            .status();
+    }
+}
+
+fn current_config(state: &RouterState) -> AppConfig {
+    AppConfig {
+        device_a: state.selected_pair.0.clone(),
+        device_b: state.selected_pair.1.clone(),
+        volume_a: state.volume_a,
+        volume_b: state.volume_b,
+        mute_a: state.mute_a,
+        mute_b: state.mute_b,
+        delay_ms_a: state.delay_ms_a,
+        delay_ms_b: state.delay_ms_b,
+        mode: state.mode,
+    }
+}
+
+fn persist_state(state: &RouterState) {
+    let cfg = current_config(state);
+    if let Err(e) = crate::config::save_config(&cfg) {
+        warn!("Failed to persist config to TOML: {:?}", e);
+    }
 }
 
 fn set_default_sink_metadata(metadata: &pw::metadata::Metadata, sink_name: &str) {
@@ -422,6 +506,14 @@ fn try_link_device(state: &mut RouterState, target_name: &str) -> Result<bool> {
         _link_fr: link_fr,
     });
 
+    let (vol, mute) = if state.selected_pair.0.as_deref() == Some(target_name) {
+        (state.volume_a, state.mute_a)
+    } else {
+        (state.volume_b, state.mute_b)
+    };
+    apply_device_volume(target_name, Some(target_node_id), vol);
+    apply_device_mute(target_name, Some(target_node_id), mute);
+
     Ok(true)
 }
 
@@ -574,6 +666,28 @@ fn run_pipewire_loop(
             devices.sort_by(|a, b| a.name.cmp(&b.name));
             let _ = resp_tx.send(devices);
         }
+        PwCommand::ApplyConfig { config, resp } => {
+            let mut st = state_for_cmds.borrow_mut();
+            st.selected_pair = (config.device_a.clone(), config.device_b.clone());
+            st.volume_a = config.volume_a;
+            st.volume_b = config.volume_b;
+            st.mute_a = config.mute_a;
+            st.mute_b = config.mute_b;
+            st.delay_ms_a = config.delay_ms_a;
+            st.delay_ms_b = config.delay_ms_b;
+            st.mode = config.mode;
+
+            if config.device_a.is_some() && config.device_b.is_some() {
+                if let Err(e) = ensure_virtual_sink(&mut st) {
+                    let _ = resp.send(Err(e));
+                    return;
+                }
+                try_relink_all(&mut st);
+            }
+            emit_status(&st);
+            persist_state(&st);
+            let _ = resp.send(Ok(()));
+        }
         PwCommand::SelectPair {
             device_a,
             device_b,
@@ -597,6 +711,7 @@ fn run_pipewire_loop(
 
             try_relink_all(&mut st);
             emit_status(&st);
+            persist_state(&st);
             let _ = resp.send(Ok(()));
         }
         PwCommand::GetStatus(resp_tx) => {
@@ -613,14 +728,19 @@ fn run_pipewire_loop(
             let mut found = false;
             if st.selected_pair.0.as_deref() == Some(&device) {
                 st.volume_a = vol;
+                let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
+                apply_device_volume(&device, node_id, vol);
                 found = true;
             }
             if st.selected_pair.1.as_deref() == Some(&device) {
                 st.volume_b = vol;
+                let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
+                apply_device_volume(&device, node_id, vol);
                 found = true;
             }
             if found {
                 emit_status(&st);
+                persist_state(&st);
                 let _ = resp.send(Ok(()));
             } else {
                 let _ = resp.send(Err(anyhow::anyhow!(
@@ -633,15 +753,22 @@ fn run_pipewire_loop(
             let mut st = state_for_cmds.borrow_mut();
             let mut found = false;
             if st.selected_pair.0.as_deref() == Some(&device) {
-                st.mute_a = mute.unwrap_or(!st.mute_a);
+                let new_mute = mute.unwrap_or(!st.mute_a);
+                st.mute_a = new_mute;
+                let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
+                apply_device_mute(&device, node_id, new_mute);
                 found = true;
             }
             if st.selected_pair.1.as_deref() == Some(&device) {
-                st.mute_b = mute.unwrap_or(!st.mute_b);
+                let new_mute = mute.unwrap_or(!st.mute_b);
+                st.mute_b = new_mute;
+                let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
+                apply_device_mute(&device, node_id, new_mute);
                 found = true;
             }
             if found {
                 emit_status(&st);
+                persist_state(&st);
                 let _ = resp.send(Ok(()));
             } else {
                 let _ = resp.send(Err(anyhow::anyhow!(
@@ -667,6 +794,7 @@ fn run_pipewire_loop(
             }
             if found {
                 emit_status(&st);
+                persist_state(&st);
                 let _ = resp.send(Ok(()));
             } else {
                 let _ = resp.send(Err(anyhow::anyhow!(
@@ -679,6 +807,7 @@ fn run_pipewire_loop(
             let mut st = state_for_cmds.borrow_mut();
             st.mode = mode;
             emit_status(&st);
+            persist_state(&st);
             let _ = resp.send(Ok(()));
         }
         PwCommand::RestoreDefault(resp_tx) => {

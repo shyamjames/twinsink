@@ -1,3 +1,4 @@
+mod config;
 mod ipc;
 mod pipewire_thread;
 
@@ -62,39 +63,39 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Determine initial pair: CLI flags or first two available sinks
-    let (dev_a, dev_b) = match (args.device_a, args.device_b) {
-        (Some(a), Some(b)) => (Some(a), Some(b)),
-        (Some(a), None) => {
-            let b = devices.iter().find(|d| d.name != a).map(|d| d.name.clone());
-            (Some(a), b)
-        }
-        (None, Some(b)) => {
-            let a = devices.iter().find(|d| d.name != b).map(|d| d.name.clone());
-            (a, Some(b))
-        }
-        (None, None) => {
-            if devices.len() >= 2 {
-                (Some(devices[0].name.clone()), Some(devices[1].name.clone()))
-            } else if devices.len() == 1 {
-                (Some(devices[0].name.clone()), None)
-            } else {
-                (None, None)
-            }
-        }
-    };
+    // Load persisted configuration from ~/.config/twinsink/config.toml
+    let mut cfg = config::load_config().unwrap_or_default();
 
-    if let (Some(a), Some(b)) = (&dev_a, &dev_b) {
-        info!(
-            device_a = %a,
-            device_b = %b,
-            "Selecting output pair and linking twinsink"
-        );
-        if let Err(e) = handle.select_pair(a.clone(), b.clone()).await {
-            warn!("Failed to select initial pair: {:?}", e);
+    // CLI flags override config
+    if let Some(a) = args.device_a {
+        cfg.device_a = Some(a);
+    }
+    if let Some(b) = args.device_b {
+        cfg.device_b = Some(b);
+    }
+
+    // If still missing devices, pick first available sinks
+    if cfg.device_a.is_none() && cfg.device_b.is_none() {
+        if devices.len() >= 2 {
+            cfg.device_a = Some(devices[0].name.clone());
+            cfg.device_b = Some(devices[1].name.clone());
+        } else if devices.len() == 1 {
+            cfg.device_a = Some(devices[0].name.clone());
         }
-    } else {
-        warn!("Less than two audio devices available; waiting for selection/hotplug");
+    }
+
+    info!(
+        device_a = ?cfg.device_a,
+        device_b = ?cfg.device_b,
+        volume_a = cfg.volume_a,
+        volume_b = cfg.volume_b,
+        mute_a = cfg.mute_a,
+        mute_b = cfg.mute_b,
+        "Applying configuration to router"
+    );
+
+    if let Err(e) = handle.apply_config(cfg).await {
+        warn!("Failed to apply initial configuration: {:?}", e);
     }
 
     // Setup broadcast channel for IPC subscribers
