@@ -1,0 +1,18 @@
+[package]
+name = "twinsink-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "twinsink-tui"
+path = "src/main.rs"
+
+[dependencies]
+twinsink-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+anyhow.workspace = true
