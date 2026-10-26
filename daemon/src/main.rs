@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     let args = Args::parse();
-    info!("Starting twinsink daemon (Phase 4: IPC + CLI)");
+    info!("Starting twinsink daemon");
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (handle, _cmd_tx) = PipewireHandle::spawn(event_tx)?;
