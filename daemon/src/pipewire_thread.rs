@@ -437,12 +437,16 @@ fn ensure_capture_stream(state: &mut RouterState) -> Result<()> {
                     return;
                 }
                 let chunk = &mut datas[0];
+                let offset = chunk.chunk().offset() as usize;
                 let chunk_size = chunk.chunk().size() as usize;
                 if let Some(bytes) = chunk.data() {
-                    let n_samples = chunk_size / std::mem::size_of::<f32>();
-                    if n_samples > 0 {
-                        if let Ok(mut pipe) = pipeline.lock() {
-                            pipe.push_raw_bytes(bytes, n_samples);
+                    if bytes.len() >= offset + chunk_size {
+                        let valid_bytes = &bytes[offset..offset + chunk_size];
+                        let n_samples = chunk_size / std::mem::size_of::<f32>();
+                        if n_samples > 0 {
+                            if let Ok(mut pipe) = pipeline.lock() {
+                                pipe.push_raw_bytes(valid_bytes, n_samples);
+                            }
                         }
                     }
                 }

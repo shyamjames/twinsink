@@ -4,15 +4,15 @@ use twinsink_core::ChannelMode;
 pub const SAMPLE_RATE: u32 = 48000;
 pub const CHANNELS: usize = 2;
 pub const RING_CAPACITY_FRAMES: usize = 240_000; // 5 seconds @ 48kHz
-pub const BASE_CUSHION_FRAMES: u64 = 4096; // ~85ms cushion to absorb graph jitter
+pub const BASE_CUSHION_FRAMES: u64 = 2048; // ~42.6ms cushion to absorb graph jitter
 
 pub struct AudioPipeline {
     ring_buffer: Vec<f32>,
     write_frame: u64,
     read_frame_a: u64,
     read_frame_b: u64,
-    initialized_a: bool,
-    initialized_b: bool,
+    buffering_a: bool,
+    buffering_b: bool,
     sync_needed_a: bool,
     sync_needed_b: bool,
     pub mode: ChannelMode,
@@ -39,8 +39,8 @@ impl AudioPipeline {
             write_frame: 0,
             read_frame_a: 0,
             read_frame_b: 0,
-            initialized_a: false,
-            initialized_b: false,
+            buffering_a: true,
+            buffering_b: true,
             sync_needed_a: false,
             sync_needed_b: false,
             mode,
@@ -88,18 +88,38 @@ impl AudioPipeline {
     pub fn read_frames_a(&mut self, out_bytes: &mut [u8], n_frames: usize) {
         let delay_frames = (self.delay_ms_a as u64 * SAMPLE_RATE as u64) / 1000;
         let target_delay = BASE_CUSHION_FRAMES + delay_frames;
-        let ideal_read = self.write_frame.saturating_sub(target_delay);
 
-        if !self.initialized_a || self.sync_needed_a {
-            self.read_frame_a = ideal_read;
-            self.initialized_a = true;
+        if self.sync_needed_a {
+            self.read_frame_a = self.write_frame.saturating_sub(target_delay);
+            self.buffering_a = true;
             self.sync_needed_a = false;
-        } else {
-            let diff = self.read_frame_a.abs_diff(ideal_read);
-            if diff > 12000 {
-                self.read_frame_a = ideal_read;
-            }
         }
+
+        let available = self.write_frame.saturating_sub(self.read_frame_a);
+
+        if self.buffering_a {
+            if available < target_delay {
+                out_bytes.fill(0);
+                return;
+            }
+            self.read_frame_a = self.write_frame.saturating_sub(target_delay);
+            self.buffering_a = false;
+        }
+
+        let available = self.write_frame.saturating_sub(self.read_frame_a);
+        if available == 0 {
+            self.buffering_a = true;
+            self.read_frame_a = self.write_frame;
+            out_bytes.fill(0);
+            return;
+        }
+
+        if available > RING_CAPACITY_FRAMES as u64 {
+            self.read_frame_a = self.write_frame.saturating_sub(target_delay);
+        }
+
+        let available = self.write_frame.saturating_sub(self.read_frame_a);
+        let frames_to_read = n_frames.min(available as usize);
 
         let gain = if self.mute_a {
             0.0
@@ -107,14 +127,11 @@ impl AudioPipeline {
             self.volume_a.clamp(0.0, 1.0)
         };
 
-        for i in 0..n_frames {
+        for i in 0..frames_to_read {
             let current_frame = self.read_frame_a + i as u64;
-            let (raw_l, raw_r) = if current_frame < self.write_frame {
-                let pos = ((current_frame as usize) % RING_CAPACITY_FRAMES) * CHANNELS;
-                (self.ring_buffer[pos], self.ring_buffer[pos + 1])
-            } else {
-                (0.0, 0.0)
-            };
+            let pos = ((current_frame as usize) % RING_CAPACITY_FRAMES) * CHANNELS;
+            let raw_l = self.ring_buffer[pos];
+            let raw_r = self.ring_buffer[pos + 1];
 
             let (mapped_l, mapped_r) = match self.mode {
                 ChannelMode::Duplicate => (raw_l, raw_r),
@@ -133,24 +150,50 @@ impl AudioPipeline {
             out_bytes[byte_pos + 4..byte_pos + 8].copy_from_slice(&final_r.to_ne_bytes());
         }
 
-        self.read_frame_a += n_frames as u64;
+        if frames_to_read < n_frames {
+            out_bytes[frames_to_read * 8..n_frames * 8].fill(0);
+            self.read_frame_a = self.write_frame;
+            self.buffering_a = true;
+        } else {
+            self.read_frame_a += frames_to_read as u64;
+        }
     }
 
     pub fn read_frames_b(&mut self, out_bytes: &mut [u8], n_frames: usize) {
         let delay_frames = (self.delay_ms_b as u64 * SAMPLE_RATE as u64) / 1000;
         let target_delay = BASE_CUSHION_FRAMES + delay_frames;
-        let ideal_read = self.write_frame.saturating_sub(target_delay);
 
-        if !self.initialized_b || self.sync_needed_b {
-            self.read_frame_b = ideal_read;
-            self.initialized_b = true;
+        if self.sync_needed_b {
+            self.read_frame_b = self.write_frame.saturating_sub(target_delay);
+            self.buffering_b = true;
             self.sync_needed_b = false;
-        } else {
-            let diff = self.read_frame_b.abs_diff(ideal_read);
-            if diff > 12000 {
-                self.read_frame_b = ideal_read;
-            }
         }
+
+        let available = self.write_frame.saturating_sub(self.read_frame_b);
+
+        if self.buffering_b {
+            if available < target_delay {
+                out_bytes.fill(0);
+                return;
+            }
+            self.read_frame_b = self.write_frame.saturating_sub(target_delay);
+            self.buffering_b = false;
+        }
+
+        let available = self.write_frame.saturating_sub(self.read_frame_b);
+        if available == 0 {
+            self.buffering_b = true;
+            self.read_frame_b = self.write_frame;
+            out_bytes.fill(0);
+            return;
+        }
+
+        if available > RING_CAPACITY_FRAMES as u64 {
+            self.read_frame_b = self.write_frame.saturating_sub(target_delay);
+        }
+
+        let available = self.write_frame.saturating_sub(self.read_frame_b);
+        let frames_to_read = n_frames.min(available as usize);
 
         let gain = if self.mute_b {
             0.0
@@ -158,14 +201,11 @@ impl AudioPipeline {
             self.volume_b.clamp(0.0, 1.0)
         };
 
-        for i in 0..n_frames {
+        for i in 0..frames_to_read {
             let current_frame = self.read_frame_b + i as u64;
-            let (raw_l, raw_r) = if current_frame < self.write_frame {
-                let pos = ((current_frame as usize) % RING_CAPACITY_FRAMES) * CHANNELS;
-                (self.ring_buffer[pos], self.ring_buffer[pos + 1])
-            } else {
-                (0.0, 0.0)
-            };
+            let pos = ((current_frame as usize) % RING_CAPACITY_FRAMES) * CHANNELS;
+            let raw_l = self.ring_buffer[pos];
+            let raw_r = self.ring_buffer[pos + 1];
 
             let (mapped_l, mapped_r) = match self.mode {
                 ChannelMode::Duplicate => (raw_l, raw_r),
@@ -184,7 +224,13 @@ impl AudioPipeline {
             out_bytes[byte_pos + 4..byte_pos + 8].copy_from_slice(&final_r.to_ne_bytes());
         }
 
-        self.read_frame_b += n_frames as u64;
+        if frames_to_read < n_frames {
+            out_bytes[frames_to_read * 8..n_frames * 8].fill(0);
+            self.read_frame_b = self.write_frame;
+            self.buffering_b = true;
+        } else {
+            self.read_frame_b += frames_to_read as u64;
+        }
     }
 
     pub fn set_delay_a(&mut self, delay_ms: u32) {
@@ -390,5 +436,39 @@ mod tests {
             sample_a - sample_b,
             expected_diff
         );
+    }
+
+    #[test]
+    fn test_pipeline_intermittent_speech() {
+        let mut pipeline = AudioPipeline::new(ChannelMode::Duplicate, 0, 0, 1.0, 1.0, false, false);
+
+        // First syllable: 3000 frames
+        let frames1 = generate_test_stereo_frames(3000);
+        pipeline.push_raw_bytes(&frames_to_bytes(&frames1), frames1.len());
+
+        let mut out = vec![0u8; 8 * 1000];
+        pipeline.read_frames_a(&mut out, 1000);
+        let sample1 = f32::from_ne_bytes(out[0..4].try_into().unwrap());
+        assert!(sample1 > 0.0);
+
+        // Read remaining frames
+        pipeline.read_frames_a(&mut out, 1000);
+        pipeline.read_frames_a(&mut out, 1000);
+
+        // Gap / pause between syllables (reads while no incoming audio)
+        for _ in 0..3 {
+            pipeline.read_frames_a(&mut out, 1000);
+            let s = f32::from_ne_bytes(out[0..4].try_into().unwrap());
+            assert_eq!(s, 0.0);
+        }
+
+        // Second syllable: 3000 frames
+        let frames2 = generate_test_stereo_frames(3000);
+        pipeline.push_raw_bytes(&frames_to_bytes(&frames2), frames2.len());
+
+        // Next read should play second syllable cleanly without glitches
+        pipeline.read_frames_a(&mut out, 1000);
+        let sample2 = f32::from_ne_bytes(out[0..4].try_into().unwrap());
+        assert!(sample2 > 0.0);
     }
 }
