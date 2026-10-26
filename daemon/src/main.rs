@@ -1,11 +1,15 @@
+mod ipc;
 mod pipewire_thread;
 
 use anyhow::Result;
 use clap::Parser;
+use ipc::IpcServer;
 use pipewire_thread::{PipewireHandle, PwEvent};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
+use twinsink_core::DaemonEvent;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -31,10 +35,11 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     let args = Args::parse();
-    info!("Starting twinsink daemon (Phase 3: Virtual sink + linking)");
+    info!("Starting twinsink daemon (Phase 4: IPC + CLI)");
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (handle, _cmd_tx) = PipewireHandle::spawn(event_tx)?;
+    let handle = Arc::new(handle);
 
     // Allow PipeWire to collect registry globals and perform startup recovery check
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
@@ -42,7 +47,9 @@ async fn main() -> Result<()> {
     if args.restore_only {
         info!("Restore-only requested, shutting down");
         handle.restore_default().await?;
-        handle.shutdown()?;
+        if let Ok(h) = Arc::try_unwrap(handle) {
+            h.shutdown()?;
+        }
         return Ok(());
     }
 
@@ -55,7 +62,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Determine device pair: CLI flags or first two available sinks
+    // Determine initial pair: CLI flags or first two available sinks
     let (dev_a, dev_b) = match (args.device_a, args.device_b) {
         (Some(a), Some(b)) => (Some(a), Some(b)),
         (Some(a), None) => {
@@ -90,6 +97,15 @@ async fn main() -> Result<()> {
         warn!("Less than two audio devices available; waiting for selection/hotplug");
     }
 
+    // Setup broadcast channel for IPC subscribers
+    let (bcast_tx, _) = broadcast::channel::<DaemonEvent>(64);
+    let ipc_server = IpcServer::bind(handle.clone(), bcast_tx.clone()).await?;
+    tokio::spawn(async move {
+        if let Err(e) = ipc_server.run().await {
+            warn!("IPC server stopped: {:?}", e);
+        }
+    });
+
     let shutdown_signal = tokio::signal::ctrl_c();
     tokio::pin!(shutdown_signal);
 
@@ -103,25 +119,37 @@ async fn main() -> Result<()> {
                 match event {
                     PwEvent::Added(dev) => {
                         info!("Event: Added -> {} ({})", dev.name, dev.description);
+                        if let Ok(devs) = handle.list_devices().await {
+                            let _ = bcast_tx.send(DaemonEvent::Devices { devices: devs });
+                        }
                     }
                     PwEvent::Removed { id, name } => {
                         info!("Event: Removed -> [{}] {}", id, name);
+                        if let Ok(devs) = handle.list_devices().await {
+                            let _ = bcast_tx.send(DaemonEvent::Devices { devices: devs });
+                        }
                     }
                     PwEvent::Changed(dev) => {
                         info!("Event: Changed -> {} state={:?}", dev.name, dev.state);
+                        if let Ok(devs) = handle.list_devices().await {
+                            let _ = bcast_tx.send(DaemonEvent::Devices { devices: devs });
+                        }
                     }
                     PwEvent::Status(status) => {
                         info!(
                             "Status update: pair=({:?}, {:?}) connected=({}, {})",
                             status.device_a, status.device_b, status.connected_a, status.connected_b
                         );
+                        let _ = bcast_tx.send(DaemonEvent::Status(status));
                     }
                 }
             }
         }
     }
 
-    handle.shutdown()?;
+    if let Ok(h) = Arc::try_unwrap(handle) {
+        h.shutdown()?;
+    }
     info!("twinsink daemon stopped cleanly");
     Ok(())
 }

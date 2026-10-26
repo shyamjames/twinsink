@@ -156,7 +156,9 @@ pub enum IpcResponse {
         message: Option<String>,
     },
     Status(DaemonStatus),
-    Devices(Vec<AudioDevice>),
+    Devices {
+        devices: Vec<AudioDevice>,
+    },
     Error {
         message: String,
     },
@@ -166,5 +168,28 @@ pub enum IpcResponse {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum DaemonEvent {
     Status(DaemonStatus),
-    Devices(Vec<AudioDevice>),
+    Devices { devices: Vec<AudioDevice> },
+}
+
+pub fn socket_path() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        std::path::PathBuf::from(dir).join("twinsink.sock")
+    } else {
+        std::path::PathBuf::from("/tmp/twinsink.sock")
+    }
+}
+
+pub fn config_path() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        std::path::PathBuf::from(dir)
+            .join("twinsink")
+            .join("config.toml")
+    } else if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home)
+            .join(".config")
+            .join("twinsink")
+            .join("config.toml")
+    } else {
+        std::path::PathBuf::from("/tmp/twinsink/config.toml")
+    }
 }

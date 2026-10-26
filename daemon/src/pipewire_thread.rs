@@ -19,8 +19,26 @@ pub enum PwCommand {
         device_b: String,
         resp: oneshot::Sender<Result<()>>,
     },
-    #[allow(dead_code)]
     GetStatus(oneshot::Sender<DaemonStatus>),
+    SetVolume {
+        device: String,
+        volume: f32,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    SetMute {
+        device: String,
+        mute: Option<bool>,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    SetDelay {
+        device: String,
+        delay_ms: u32,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    SetMode {
+        mode: ChannelMode,
+        resp: oneshot::Sender<Result<()>>,
+    },
     RestoreDefault(oneshot::Sender<Result<()>>),
     Terminate,
 }
@@ -67,6 +85,13 @@ struct RouterState {
     sinks: HashMap<u32, SinkRecord>,
     ports: HashMap<u32, PortRecord>,
     selected_pair: (Option<String>, Option<String>),
+    volume_a: f32,
+    volume_b: f32,
+    mute_a: bool,
+    mute_b: bool,
+    delay_ms_a: u32,
+    delay_ms_b: u32,
+    mode: ChannelMode,
     links: Vec<LinkedDevice>,
     original_default_sink: Option<String>,
     configured_default_sink: Option<String>,
@@ -126,13 +151,59 @@ impl PipewireHandle {
             .context("Failed to receive select pair reply")?
     }
 
-    #[allow(dead_code)]
     pub async fn get_status(&self) -> Result<DaemonStatus> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
             .send(PwCommand::GetStatus(resp_tx))
             .map_err(|_| anyhow::anyhow!("Failed to send GetStatus command"))?;
         resp_rx.await.context("Failed to receive status")
+    }
+
+    pub async fn set_volume(&self, device: String, volume: f32) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PwCommand::SetVolume {
+                device,
+                volume,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send SetVolume command"))?;
+        resp_rx.await.context("Failed to receive SetVolume reply")?
+    }
+
+    pub async fn set_mute(&self, device: String, mute: Option<bool>) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PwCommand::SetMute {
+                device,
+                mute,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send SetMute command"))?;
+        resp_rx.await.context("Failed to receive SetMute reply")?
+    }
+
+    pub async fn set_delay(&self, device: String, delay_ms: u32) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PwCommand::SetDelay {
+                device,
+                delay_ms,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send SetDelay command"))?;
+        resp_rx.await.context("Failed to receive SetDelay reply")?
+    }
+
+    pub async fn set_mode(&self, mode: ChannelMode) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PwCommand::SetMode {
+                mode,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send SetMode command"))?;
+        resp_rx.await.context("Failed to receive SetMode reply")?
     }
 
     pub async fn restore_default(&self) -> Result<()> {
@@ -251,13 +322,13 @@ fn current_status(state: &RouterState) -> DaemonStatus {
         device_b: state.selected_pair.1.clone(),
         connected_a,
         connected_b,
-        volume_a: 1.0,
-        volume_b: 1.0,
-        mute_a: false,
-        mute_b: false,
-        delay_ms_a: 0,
-        delay_ms_b: 0,
-        mode: ChannelMode::Duplicate,
+        volume_a: state.volume_a,
+        volume_b: state.volume_b,
+        mute_a: state.mute_a,
+        mute_b: state.mute_b,
+        delay_ms_a: state.delay_ms_a,
+        delay_ms_b: state.delay_ms_b,
+        mode: state.mode,
     }
 }
 
@@ -469,6 +540,13 @@ fn run_pipewire_loop(
         sinks: HashMap::new(),
         ports: HashMap::new(),
         selected_pair: (None, None),
+        volume_a: 1.0,
+        volume_b: 1.0,
+        mute_a: false,
+        mute_b: false,
+        delay_ms_a: 0,
+        delay_ms_b: 0,
+        mode: ChannelMode::Duplicate,
         links: Vec::new(),
         original_default_sink: None,
         configured_default_sink: None,
@@ -524,6 +602,84 @@ fn run_pipewire_loop(
         PwCommand::GetStatus(resp_tx) => {
             let status = current_status(&state_for_cmds.borrow());
             let _ = resp_tx.send(status);
+        }
+        PwCommand::SetVolume {
+            device,
+            volume,
+            resp,
+        } => {
+            let mut st = state_for_cmds.borrow_mut();
+            let vol = volume.clamp(0.0, 1.0);
+            let mut found = false;
+            if st.selected_pair.0.as_deref() == Some(&device) {
+                st.volume_a = vol;
+                found = true;
+            }
+            if st.selected_pair.1.as_deref() == Some(&device) {
+                st.volume_b = vol;
+                found = true;
+            }
+            if found {
+                emit_status(&st);
+                let _ = resp.send(Ok(()));
+            } else {
+                let _ = resp.send(Err(anyhow::anyhow!(
+                    "Device '{}' is not one of the selected outputs",
+                    device
+                )));
+            }
+        }
+        PwCommand::SetMute { device, mute, resp } => {
+            let mut st = state_for_cmds.borrow_mut();
+            let mut found = false;
+            if st.selected_pair.0.as_deref() == Some(&device) {
+                st.mute_a = mute.unwrap_or(!st.mute_a);
+                found = true;
+            }
+            if st.selected_pair.1.as_deref() == Some(&device) {
+                st.mute_b = mute.unwrap_or(!st.mute_b);
+                found = true;
+            }
+            if found {
+                emit_status(&st);
+                let _ = resp.send(Ok(()));
+            } else {
+                let _ = resp.send(Err(anyhow::anyhow!(
+                    "Device '{}' is not one of the selected outputs",
+                    device
+                )));
+            }
+        }
+        PwCommand::SetDelay {
+            device,
+            delay_ms,
+            resp,
+        } => {
+            let mut st = state_for_cmds.borrow_mut();
+            let mut found = false;
+            if st.selected_pair.0.as_deref() == Some(&device) {
+                st.delay_ms_a = delay_ms;
+                found = true;
+            }
+            if st.selected_pair.1.as_deref() == Some(&device) {
+                st.delay_ms_b = delay_ms;
+                found = true;
+            }
+            if found {
+                emit_status(&st);
+                let _ = resp.send(Ok(()));
+            } else {
+                let _ = resp.send(Err(anyhow::anyhow!(
+                    "Device '{}' is not one of the selected outputs",
+                    device
+                )));
+            }
+        }
+        PwCommand::SetMode { mode, resp } => {
+            let mut st = state_for_cmds.borrow_mut();
+            st.mode = mode;
+            emit_status(&st);
+            let _ = resp.send(Ok(()));
         }
         PwCommand::RestoreDefault(resp_tx) => {
             let st = state_for_cmds.borrow();
