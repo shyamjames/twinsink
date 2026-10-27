@@ -152,8 +152,13 @@ impl AudioPipeline {
 
         if frames_to_read < n_frames {
             out_bytes[frames_to_read * 8..n_frames * 8].fill(0);
+            // The consumer can run a little faster than the capture stream
+            // (Bluetooth clocks are a common example).  Continue from the
+            // live edge after a short underrun instead of waiting for a
+            // complete cushion again; that turns a one-buffer timing error
+            // into at most one partially silent buffer.
             self.read_frame_a = self.write_frame;
-            self.buffering_a = true;
+            self.buffering_a = false;
         } else {
             self.read_frame_a += frames_to_read as u64;
         }
@@ -227,7 +232,7 @@ impl AudioPipeline {
         if frames_to_read < n_frames {
             out_bytes[frames_to_read * 8..n_frames * 8].fill(0);
             self.read_frame_b = self.write_frame;
-            self.buffering_b = true;
+            self.buffering_b = false;
         } else {
             self.read_frame_b += frames_to_read as u64;
         }
@@ -470,5 +475,31 @@ mod tests {
         pipeline.read_frames_a(&mut out, 1000);
         let sample2 = f32::from_ne_bytes(out[0..4].try_into().unwrap());
         assert!(sample2 > 0.0);
+    }
+
+    #[test]
+    fn test_pipeline_recovers_from_short_underrun_without_rebuffering() {
+        let mut pipeline = AudioPipeline::new(ChannelMode::Duplicate, 0, 0, 1.0, 1.0, false, false);
+        let frames = generate_test_stereo_frames(3000);
+        let mut out = vec![0u8; 8 * 1000];
+
+        pipeline.push_raw_bytes(&frames_to_bytes(&frames), frames.len());
+        pipeline.read_frames_a(&mut out, 1000);
+        pipeline.read_frames_a(&mut out, 1000);
+        pipeline.read_frames_a(&mut out, 1000);
+
+        // A short capture/clock mismatch leaves only part of the requested
+        // output buffer available.
+        let short = generate_test_stereo_frames(100);
+        pipeline.push_raw_bytes(&frames_to_bytes(&short), short.len());
+        pipeline.read_frames_a(&mut out, 1000);
+
+        // Once enough fresh audio exists, recovery should resume directly
+        // from the delayed position instead of buffering for another cushion.
+        let more = generate_test_stereo_frames(2000);
+        pipeline.push_raw_bytes(&frames_to_bytes(&more), more.len());
+        pipeline.read_frames_a(&mut out, 1000);
+        let sample = f32::from_ne_bytes(out[0..4].try_into().unwrap());
+        assert!(sample > 0.0);
     }
 }

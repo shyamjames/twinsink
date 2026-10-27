@@ -276,52 +276,6 @@ fn clear_saved_default() {
     let _ = std::fs::remove_file(path);
 }
 
-pub fn apply_device_volume(device_name: &str, node_id: Option<u32>, volume: f32) {
-    let vol_clamped = volume.clamp(0.0, 1.0);
-    let mut success = false;
-    if let Some(id) = node_id {
-        if let Ok(mut child) = std::process::Command::new("wpctl")
-            .args([
-                "set-volume",
-                &id.to_string(),
-                &format!("{:.2}", vol_clamped),
-            ])
-            .spawn()
-        {
-            if child.wait().is_ok() {
-                success = true;
-            }
-        }
-    }
-    if !success {
-        let percent = (vol_clamped * 100.0).round() as u32;
-        let _ = std::process::Command::new("pactl")
-            .args(["set-sink-volume", device_name, &format!("{}%", percent)])
-            .status();
-    }
-}
-
-pub fn apply_device_mute(device_name: &str, node_id: Option<u32>, mute: bool) {
-    let mut success = false;
-    if let Some(id) = node_id {
-        let mute_arg = if mute { "1" } else { "0" };
-        if let Ok(mut child) = std::process::Command::new("wpctl")
-            .args(["set-mute", &id.to_string(), mute_arg])
-            .spawn()
-        {
-            if child.wait().is_ok() {
-                success = true;
-            }
-        }
-    }
-    if !success {
-        let mute_arg = if mute { "1" } else { "0" };
-        let _ = std::process::Command::new("pactl")
-            .args(["set-sink-mute", device_name, mute_arg])
-            .status();
-    }
-}
-
 fn current_config(state: &RouterState) -> AppConfig {
     AppConfig {
         device_a: state.selected_pair.0.clone(),
@@ -357,6 +311,20 @@ fn set_default_sink_metadata(metadata: &pw::metadata::Metadata, sink_name: &str)
         Some("Spa:String:JSON"),
         Some(&json_val),
     );
+}
+
+fn restore_safe_default_sink(state: &RouterState) {
+    let fallback = state
+        .original_default_sink
+        .as_ref()
+        .filter(|name| state.sinks.values().any(|sink| &sink.name == *name))
+        .cloned()
+        .or_else(|| state.sinks.values().next().map(|sink| sink.name.clone()));
+
+    if let (Some(name), Some(metadata)) = (fallback, state.metadata.as_ref()) {
+        warn!(sink = %name, "Restoring a physical sink as default while TwinSink output is unavailable");
+        set_default_sink_metadata(metadata, &name);
+    }
 }
 
 fn current_status(state: &RouterState) -> DaemonStatus {
@@ -423,6 +391,7 @@ fn ensure_capture_stream(state: &mut RouterState) -> Result<()> {
         "target.object" => "twinsink",
         "audio.channels" => "2",
         "audio.rate" => "48000",
+        *pw::keys::NODE_LATENCY => "2048/48000",
     };
 
     let stream = pw::stream::StreamRc::new(state.core.clone(), "twinsink-capture", cap_props)?;
@@ -482,6 +451,7 @@ fn create_out_stream_a(state: &mut RouterState, target_device: &str) -> Result<(
         "target.object" => target_device,
         "audio.channels" => "2",
         "audio.rate" => "48000",
+        *pw::keys::NODE_LATENCY => "2048/48000",
     };
 
     let stream = pw::stream::StreamRc::new(state.core.clone(), "twinsink-out-a", out_props)?;
@@ -497,13 +467,18 @@ fn create_out_stream_a(state: &mut RouterState, target_device: &str) -> Result<(
                 }
                 let data = &mut datas[0];
                 let stride = 8;
+                let offset = data.chunk().offset() as usize;
                 if let Some(slice) = data.data() {
+                    if offset >= slice.len() {
+                        return;
+                    }
+                    let slice = &mut slice[offset..];
                     let n_frames = slice.len() / stride;
                     if let Ok(mut pipe) = pipeline.lock() {
                         pipe.read_frames_a(slice, n_frames);
                     }
                     let chunk = data.chunk_mut();
-                    *chunk.offset_mut() = 0;
+                    *chunk.offset_mut() = offset as _;
                     *chunk.stride_mut() = stride as _;
                     *chunk.size_mut() = (stride * n_frames) as _;
                 }
@@ -539,6 +514,7 @@ fn create_out_stream_b(state: &mut RouterState, target_device: &str) -> Result<(
         "target.object" => target_device,
         "audio.channels" => "2",
         "audio.rate" => "48000",
+        *pw::keys::NODE_LATENCY => "2048/48000",
     };
 
     let stream = pw::stream::StreamRc::new(state.core.clone(), "twinsink-out-b", out_props)?;
@@ -554,13 +530,18 @@ fn create_out_stream_b(state: &mut RouterState, target_device: &str) -> Result<(
                 }
                 let data = &mut datas[0];
                 let stride = 8;
+                let offset = data.chunk().offset() as usize;
                 if let Some(slice) = data.data() {
+                    if offset >= slice.len() {
+                        return;
+                    }
+                    let slice = &mut slice[offset..];
                     let n_frames = slice.len() / stride;
                     if let Ok(mut pipe) = pipeline.lock() {
                         pipe.read_frames_b(slice, n_frames);
                     }
                     let chunk = data.chunk_mut();
-                    *chunk.offset_mut() = 0;
+                    *chunk.offset_mut() = offset as _;
                     *chunk.stride_mut() = stride as _;
                     *chunk.size_mut() = (stride * n_frames) as _;
                 }
@@ -633,6 +614,15 @@ fn update_output_streams(state: &mut RouterState) {
         state._out_listener_b = None;
         state.out_stream_b = None;
         state.connected_b = false;
+    }
+
+    let routing_ready = state.connected_a && (state.selected_pair.1.is_none() || state.connected_b);
+    if routing_ready && state.virtual_sink_active {
+        if let Some(ref metadata) = state.metadata {
+            set_default_sink_metadata(metadata, "twinsink");
+        }
+    } else if state.virtual_sink_active {
+        restore_safe_default_sink(state);
     }
 }
 
@@ -850,8 +840,6 @@ fn run_pipewire_loop(
                 if let Ok(mut pipe) = st.pipeline.lock() {
                     pipe.set_volume_a(vol);
                 }
-                let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
-                apply_device_volume(&device, node_id, vol);
                 found = true;
             }
             if st.selected_pair.1.as_deref() == Some(&device) {
@@ -859,8 +847,6 @@ fn run_pipewire_loop(
                 if let Ok(mut pipe) = st.pipeline.lock() {
                     pipe.set_volume_b(vol);
                 }
-                let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
-                apply_device_volume(&device, node_id, vol);
                 found = true;
             }
             if found {
@@ -883,8 +869,6 @@ fn run_pipewire_loop(
                 if let Ok(mut pipe) = st.pipeline.lock() {
                     pipe.set_mute_a(new_mute);
                 }
-                let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
-                apply_device_mute(&device, node_id, new_mute);
                 found = true;
             }
             if st.selected_pair.1.as_deref() == Some(&device) {
@@ -893,8 +877,6 @@ fn run_pipewire_loop(
                 if let Ok(mut pipe) = st.pipeline.lock() {
                     pipe.set_mute_b(new_mute);
                 }
-                let node_id = st.sinks.values().find(|s| s.name == device).map(|s| s.id);
-                apply_device_mute(&device, node_id, new_mute);
                 found = true;
             }
             if found {
@@ -1219,6 +1201,7 @@ fn run_pipewire_loop(
                             sink = %removed.name,
                             "Selected sink disconnected; output stream closed"
                         );
+                        restore_safe_default_sink(&st);
                         emit_status(&st);
                     }
                 }
