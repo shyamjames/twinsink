@@ -791,7 +791,7 @@ fn run_pipewire_loop(
             device_b,
             resp,
         } => {
-            if device_a == device_b {
+            if !device_a.is_empty() && device_a == device_b {
                 let _ = resp.send(Err(anyhow::anyhow!(
                     "Device A and Device B must be different outputs"
                 )));
@@ -799,7 +799,21 @@ fn run_pipewire_loop(
             }
 
             let mut st = state_for_cmds.borrow_mut();
-            st.selected_pair = (Some(device_a.clone()), Some(device_b.clone()));
+            let selected_a = (!device_a.is_empty()).then_some(device_a);
+            let selected_b = (!device_b.is_empty()).then_some(device_b);
+            if selected_a
+                .as_ref()
+                .is_some_and(|name| !st.sinks.values().any(|sink| &sink.name == name))
+                || selected_b
+                    .as_ref()
+                    .is_some_and(|name| !st.sinks.values().any(|sink| &sink.name == name))
+            {
+                let _ = resp.send(Err(anyhow::anyhow!(
+                    "Selected output is no longer available; refresh the device list"
+                )));
+                return;
+            }
+            st.selected_pair = (selected_a, selected_b);
 
             // Reset previous output streams
             st._out_listener_a = None;
@@ -808,6 +822,20 @@ fn run_pipewire_loop(
             st.out_stream_b = None;
             st.connected_a = false;
             st.connected_b = false;
+
+            if st.selected_pair.0.is_none() && st.selected_pair.1.is_none() {
+                st._out_listener_a = None;
+                st.out_stream_a = None;
+                st._out_listener_b = None;
+                st.out_stream_b = None;
+                st.connected_a = false;
+                st.connected_b = false;
+                restore_safe_default_sink(&st);
+                emit_status(&st);
+                persist_state(&st);
+                let _ = resp.send(Ok(()));
+                return;
+            }
 
             if let Err(e) = ensure_virtual_sink(&mut st) {
                 let _ = resp.send(Err(e));
@@ -1202,6 +1230,17 @@ fn run_pipewire_loop(
                             "Selected sink disconnected; output stream closed"
                         );
                         restore_safe_default_sink(&st);
+                        // Keep TwinSink as the default when at least one selected
+                        // output remains usable. A removed node may reappear with
+                        // a new global ID during profile changes or hotplug.
+                        if st.connected_a
+                            && (st.selected_pair.1.is_none() || st.connected_b)
+                            && st.virtual_sink_active
+                        {
+                            if let Some(metadata) = st.metadata.as_ref() {
+                                set_default_sink_metadata(metadata, "twinsink");
+                            }
+                        }
                         emit_status(&st);
                     }
                 }

@@ -1,0 +1,14 @@
+[package]
+name = "twinsink-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "twinsink-gui"
+path = "src/main.rs"
+
+[dependencies]
+twinsink-core.workspace = true
+gtk4.workspace = true
+serde_json.workspace = true

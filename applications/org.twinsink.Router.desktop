@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=TwinSink Audio Router
+Comment=Configure TwinSink multi-output audio routing
+Exec=twinsink-gui
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+StartupNotify=true

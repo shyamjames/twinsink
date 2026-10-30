@@ -4,7 +4,7 @@
 
 It creates a virtual PipeWire audio sink (`twinsink`), sets it as your system-wide default output, and routes incoming audio simultaneously to exactly **TWO** selected audio output devices (e.g., your laptop speakers + Bluetooth headphones, or wired headphones + external monitor over HDMI).
 
-TwinSink operates entirely over a local Unix domain socket with zero network footprint. It includes a scriptable CLI (`twinsink`) and an interactive terminal user interface (`twinsink-tui`).
+TwinSink operates entirely over a local Unix domain socket with zero network footprint. It includes a scriptable CLI (`twinsink`), an interactive terminal interface (`twinsink-tui`), and a GTK 4 desktop interface (`twinsink-gui`).
 
 ---
 
@@ -48,13 +48,24 @@ rustup default stable
 
 ## 2. Build and Install
 
-From the root of this repository, install the three binaries (`twinsink-daemon`, `twinsink`, `twinsink-tui`) to your Cargo bin directory:
+From the root of this repository, install the binaries to your Cargo bin directory:
 
 ```bash
 cargo install --path daemon
 cargo install --path cli
 cargo install --path tui
+cargo install --path gui
 ```
+
+To add TwinSink to your desktop app launcher, install the provided desktop entry:
+
+```bash
+mkdir -p ~/.local/share/applications
+cp applications/org.twinsink.Router.desktop ~/.local/share/applications/
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+```
+
+The launcher runs `twinsink-gui`, so ensure `~/.cargo/bin` is on your `PATH`. You can also start the interface from a terminal with `twinsink-gui`.
 
 ### Ensure Cargo Bin is in your `PATH`
 

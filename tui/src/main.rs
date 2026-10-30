@@ -144,6 +144,10 @@ async fn main() -> Result<()> {
                                 }
                                 DaemonEvent::Devices { devices } => {
                                     state.devices = devices;
+                                    if let Some(status) = state.status.as_mut() {
+                                        status.connected_a = status.device_a.as_ref().is_some_and(|name| state.devices.iter().any(|device| &device.name == name));
+                                        status.connected_b = status.device_b.as_ref().is_some_and(|name| state.devices.iter().any(|device| &device.name == name));
+                                    }
                                     if state.selected_list_idx >= state.devices.len() && !state.devices.is_empty() {
                                         state.selected_list_idx = state.devices.len() - 1;
                                     }
@@ -217,43 +221,72 @@ async fn handle_key_event(key: KeyEvent, state: &mut TuiState) {
         KeyCode::Char('1') => {
             // Assign highlighted device to Device A
             if let Some(target) = state.devices.get(state.selected_list_idx) {
-                let current_b = state
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.device_b.clone())
-                    .unwrap_or_default();
-                if target.name != current_b && !current_b.is_empty() {
+                let current_b = state.status.as_ref().and_then(|s| s.device_b.clone());
+                if current_b.as_deref() != Some(&target.name) {
                     let req = IpcRequest::Select {
                         device_a: target.name.clone(),
-                        device_b: current_b,
+                        device_b: current_b.unwrap_or_default(),
                     };
-                    if let Ok(IpcResponse::Ok { message }) = send_command(&req).await {
-                        state.set_msg(message.unwrap_or_else(|| "Updated output pair".into()));
+                    match send_command(&req).await {
+                        Ok(IpcResponse::Ok { message }) => {
+                            state.set_msg(message.unwrap_or_else(|| "Updated output pair".into()))
+                        }
+                        Ok(IpcResponse::Error { message }) => state.set_msg(message),
+                        Err(e) => state.set_msg(e.to_string()),
+                        _ => {}
                     }
                 } else {
-                    state.set_msg("Device A and B must be different");
+                    state.set_msg("That device is already assigned to B");
                 }
             }
         }
         KeyCode::Char('2') => {
             // Assign highlighted device to Device B
             if let Some(target) = state.devices.get(state.selected_list_idx) {
-                let current_a = state
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.device_a.clone())
-                    .unwrap_or_default();
-                if target.name != current_a && !current_a.is_empty() {
+                let current_a = state.status.as_ref().and_then(|s| s.device_a.clone());
+                if current_a.as_deref() != Some(&target.name) {
                     let req = IpcRequest::Select {
-                        device_a: current_a,
+                        device_a: current_a.unwrap_or_default(),
                         device_b: target.name.clone(),
                     };
-                    if let Ok(IpcResponse::Ok { message }) = send_command(&req).await {
-                        state.set_msg(message.unwrap_or_else(|| "Updated output pair".into()));
+                    match send_command(&req).await {
+                        Ok(IpcResponse::Ok { message }) => {
+                            state.set_msg(message.unwrap_or_else(|| "Updated output pair".into()))
+                        }
+                        Ok(IpcResponse::Error { message }) => state.set_msg(message),
+                        Err(e) => state.set_msg(e.to_string()),
+                        _ => {}
                     }
                 } else {
-                    state.set_msg("Device A and B must be different");
+                    state.set_msg("That device is already assigned to A");
                 }
+            }
+        }
+        KeyCode::Char('u') => {
+            let (device_a, device_b) = state
+                .status
+                .as_ref()
+                .map(|s| (s.device_a.clone(), s.device_b.clone()))
+                .unwrap_or_default();
+            let (device_a, device_b) = match state.focus {
+                ActiveFocus::DeviceA => (None, device_b),
+                ActiveFocus::DeviceB => (device_a, None),
+                ActiveFocus::DeviceList => {
+                    state.set_msg("Tab to output A or B, then press u to unassign it");
+                    return;
+                }
+            };
+            let req = IpcRequest::Select {
+                device_a: device_a.unwrap_or_default(),
+                device_b: device_b.unwrap_or_default(),
+            };
+            match send_command(&req).await {
+                Ok(IpcResponse::Ok { message }) => {
+                    state.set_msg(message.unwrap_or_else(|| "Output unassigned".into()))
+                }
+                Ok(IpcResponse::Error { message }) => state.set_msg(message),
+                Err(e) => state.set_msg(e.to_string()),
+                _ => {}
             }
         }
         KeyCode::Char('c') | KeyCode::Char('m') if key.modifiers.is_empty() => {
@@ -735,11 +768,13 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &TuiState) {
         Span::styled("[j/k]", Style::default().fg(Color::Yellow)),
         Span::raw(" Nav  "),
         Span::styled("[1]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Set A  "),
+        Span::raw(" Assign A  "),
         Span::styled("[2]", Style::default().fg(Color::Magenta)),
-        Span::raw(" Set B  "),
+        Span::raw(" Assign B  "),
         Span::styled("[Tab]", Style::default().fg(Color::Yellow)),
         Span::raw(" Focus A/B  "),
+        Span::styled("[u]", Style::default().fg(Color::Yellow)),
+        Span::raw(" Unassign focused  "),
         Span::styled("[+/-]", Style::default().fg(Color::Yellow)),
         Span::raw(" Vol  "),
         Span::styled("[x]", Style::default().fg(Color::Yellow)),
