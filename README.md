@@ -141,7 +141,15 @@ twinsink delay <device-name> 150
 # Switch routing mode (duplicate, split, or mono)
 twinsink mode split
 twinsink mode duplicate
+
+# Move app stream 72 to the currently selected Output A
+twinsink route-app 72 a
+
+# Move app stream 88 to the currently selected Output B
+twinsink route-app 88 b
 ```
+
+Use `wpctl status` to find active stream IDs. `route-app` runs `wpctl move <stream-id> <sink-id>` under the hood, targeting the sink currently assigned to slot A or B in TwinSink.
 
 For JSON output suitable for scripting or waybar/polybar widgets, pass `--json`:
 

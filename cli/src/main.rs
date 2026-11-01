@@ -1,8 +1,9 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::process::ExitCode;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::process::Command;
 use twinsink_core::{
     socket_path, AudioDevice, ChannelMode, DaemonEvent, DaemonStatus, IpcRequest, IpcResponse,
 };
@@ -72,6 +73,29 @@ enum Commands {
 
     #[command(about = "Subscribe to live event stream from the daemon")]
     Subscribe,
+
+    #[command(about = "Route one app stream to selected output A or B")]
+    RouteApp {
+        #[arg(help = "PipeWire stream id (from `wpctl status`)")]
+        stream_id: u32,
+        #[arg(value_enum, help = "Target output slot: a or b")]
+        output: OutputSlot,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputSlot {
+    A,
+    B,
+}
+
+impl std::fmt::Display for OutputSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::A => write!(f, "a"),
+            Self::B => write!(f, "b"),
+        }
+    }
 }
 
 #[tokio::main]
@@ -416,7 +440,137 @@ async fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Commands::RouteApp { stream_id, output } => {
+            let status_req = IpcRequest::Status;
+            if let Err(e) = send_request(&mut writer, &status_req).await {
+                eprintln!("Error sending request: {}", e);
+                return ExitCode::FAILURE;
+            }
+            let status = match read_response(&mut lines).await {
+                Ok(IpcResponse::Status(status)) => status,
+                Ok(IpcResponse::Error { message }) => {
+                    eprintln!("Daemon error: {}", message);
+                    return ExitCode::FAILURE;
+                }
+                Ok(other) => {
+                    eprintln!("Unexpected response: {:?}", other);
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Error reading response: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let devices_req = IpcRequest::Devices;
+            if let Err(e) = send_request(&mut writer, &devices_req).await {
+                eprintln!("Error sending request: {}", e);
+                return ExitCode::FAILURE;
+            }
+            let devices = match read_response(&mut lines).await {
+                Ok(IpcResponse::Devices { devices }) => devices,
+                Ok(IpcResponse::Error { message }) => {
+                    eprintln!("Daemon error: {}", message);
+                    return ExitCode::FAILURE;
+                }
+                Ok(other) => {
+                    eprintln!("Unexpected response: {:?}", other);
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Error reading response: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let (target_name, target_id) = match resolve_target_output(&status, &devices, output) {
+                Ok(target) => target,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            match move_stream(stream_id, target_id).await {
+                Ok(()) => {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "status": "ok",
+                                "stream_id": stream_id,
+                                "output": output.to_string(),
+                                "target_device": target_name,
+                                "target_id": target_id
+                            })
+                        );
+                    } else {
+                        println!(
+                            "Moved stream {} to output {} ({})",
+                            stream_id, output, target_name
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
+}
+
+fn resolve_target_output(
+    status: &DaemonStatus,
+    devices: &[AudioDevice],
+    output: OutputSlot,
+) -> Result<(String, u32)> {
+    let target_name = match output {
+        OutputSlot::A => status
+            .device_a
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Output A is not selected"))?,
+        OutputSlot::B => status
+            .device_b
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Output B is not selected"))?,
+    };
+
+    let target_device = devices
+        .iter()
+        .find(|device| device.name == *target_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Selected output {} ({}) is unavailable; refresh devices",
+                output,
+                target_name
+            )
+        })?;
+
+    Ok((target_device.name.clone(), target_device.id))
+}
+
+async fn move_stream(stream_id: u32, sink_id: u32) -> Result<()> {
+    let output = Command::new("wpctl")
+        .arg("move")
+        .arg(stream_id.to_string())
+        .arg(sink_id.to_string())
+        .output()
+        .await?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let msg = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    anyhow::bail!("wpctl move failed: {}", msg);
 }
 
 async fn send_request(
@@ -490,5 +644,66 @@ fn print_devices(devices: &[AudioDevice]) {
         };
         println!("[{}] {} ({})", dev.id, dev.name, state_str);
         println!("    Description: {}", dev.description);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use twinsink_core::DeviceState;
+
+    fn mk_device(id: u32, name: &str) -> AudioDevice {
+        AudioDevice {
+            id,
+            name: name.to_string(),
+            description: name.to_string(),
+            state: DeviceState::Active,
+            volume: 1.0,
+            mute: false,
+        }
+    }
+
+    #[test]
+    fn resolve_target_output_for_a() {
+        let status = DaemonStatus {
+            virtual_sink: "twinsink".to_string(),
+            device_a: Some("sink.a".to_string()),
+            device_b: Some("sink.b".to_string()),
+            connected_a: true,
+            connected_b: true,
+            volume_a: 1.0,
+            volume_b: 1.0,
+            mute_a: false,
+            mute_b: false,
+            delay_ms_a: 0,
+            delay_ms_b: 0,
+            mode: ChannelMode::Duplicate,
+        };
+
+        let devices = vec![mk_device(11, "sink.a"), mk_device(12, "sink.b")];
+        let resolved = resolve_target_output(&status, &devices, OutputSlot::A).unwrap();
+        assert_eq!(resolved, ("sink.a".to_string(), 11));
+    }
+
+    #[test]
+    fn resolve_target_output_requires_selected_slot() {
+        let status = DaemonStatus {
+            virtual_sink: "twinsink".to_string(),
+            device_a: None,
+            device_b: Some("sink.b".to_string()),
+            connected_a: false,
+            connected_b: true,
+            volume_a: 1.0,
+            volume_b: 1.0,
+            mute_a: false,
+            mute_b: false,
+            delay_ms_a: 0,
+            delay_ms_b: 0,
+            mode: ChannelMode::Duplicate,
+        };
+
+        let err =
+            resolve_target_output(&status, &[mk_device(12, "sink.b")], OutputSlot::A).unwrap_err();
+        assert!(err.to_string().contains("Output A is not selected"));
     }
 }
